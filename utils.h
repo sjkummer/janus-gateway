@@ -154,6 +154,19 @@ int janus_pidfile_create(const char *file);
  * @returns 0 if successful, a negative integer otherwise */
 int janus_pidfile_remove(void);
 
+/*! \brief Add a folder to the protected list (meaning we won't create
+ * files there, like recordings or pcap dumps)
+ * @param folder Folder to protect */
+void janus_protected_folder_add(const char *folder);
+
+/*! \brief Check if the path points to a protected folder
+ * @param path Path we need to check
+ * @returns TRUE if the folder is protected, and FALSE otherwise */
+gboolean janus_is_folder_protected(const char *path);
+
+/*! \brief Cleanup the list of protected folder */
+void janus_protected_folders_clear(void);
+
 /*! \brief Creates a string describing the JSON type and constraint
  * @param jtype The JSON type, e.g., JSON_STRING
  * @param flags Indicates constraints for the described type
@@ -339,5 +352,17 @@ void janus_set3(guint8 *data, size_t i, guint32 val);
  * @param[in] val value to write
  */
 void janus_set4(guint8 *data, size_t i, guint32 val);
+
+/*! \brief Helper method to compress a string to gzip (using zlib)
+ * \note It's up to you to provide a buffer large enough for the compressed
+ * data: in case the buffer isn't large enough, the request will fail
+ * @param[in] compression Compression factor (1=fastest, 9=best compression)
+ * @param[in] text Pointer to the string to compress
+ * @param[in] tlen Length of the string to compress
+ * @param[in] compressed Pointer to the buffer where to compress the string to
+ * @param[in] zlen Size of the output buffer
+ * @returns The size of the compressed data, if successful, or 0 otherwise
+ */
+size_t janus_gzip_compress(int compression, char *text, size_t tlen, char *compressed, size_t zlen);
 
 #endif

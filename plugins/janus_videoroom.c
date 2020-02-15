@@ -1088,9 +1088,9 @@ void janus_videoroom_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep);
 json_t *janus_videoroom_handle_admin_message(json_t *message);
 void janus_videoroom_setup_media(janus_plugin_session *handle);
-void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_videoroom_incoming_data(janus_plugin_session *handle, char *label, char *buf, int len);
+void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *packet);
+void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet);
+void janus_videoroom_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet);
 void janus_videoroom_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_videoroom_hangup_media(janus_plugin_session *handle);
 void janus_videoroom_destroy_session(janus_plugin_session *handle, int *error);
@@ -1525,7 +1525,7 @@ typedef struct janus_videoroom_subscriber {
 	/* The following are only relevant if we're doing VP9 SVC, and are not to be confused with plain
 	 * simulcast, which has similar info (substream/templayer) but in a completely different context */
 	int spatial_layer, target_spatial_layer;
-	gint64 last_spatial_layer[2];
+	gint64 last_spatial_layer[3];
 	int temporal_layer, target_temporal_layer;
 	volatile gint destroyed;
 	janus_refcount ref;
@@ -1534,13 +1534,18 @@ typedef struct janus_videoroom_subscriber {
 typedef struct janus_videoroom_rtp_relay_packet {
 	janus_rtp_header *data;
 	gint length;
+	gboolean is_rtp;	/* This may be a data packet and not RTP */
 	gboolean is_video;
 	uint32_t ssrc[3];
 	uint32_t timestamp;
 	uint16_t seq_number;
+	/* Extensions to add, if any */
+	janus_plugin_rtp_extensions extensions;
 	/* The following are only relevant if we're doing VP9 SVC*/
 	gboolean svc;
 	janus_vp9_svc_info svc_info;
+	/* The following is only relevant for datachannels */
+	gboolean textdata;
 } janus_videoroom_rtp_relay_packet;
 
 
@@ -1687,16 +1692,10 @@ static void janus_videoroom_codecstr(janus_videoroom *videoroom, char *audio_cod
 	}
 }
 
-static void janus_videoroom_reqfir(janus_videoroom_publisher *publisher, const char *reason) {
-	/* Send a FIR */
-	char buf[20];
-	janus_rtcp_fir((char *)&buf, 20, &publisher->fir_seq);
-	JANUS_LOG(LOG_VERB, "%s sending FIR to %"SCNu64" (%s)\n", reason, publisher->user_id, publisher->display ? publisher->display : "??");
-	gateway->relay_rtcp(publisher->session->handle, 1, buf, 20);
-	/* Send a PLI too, just in case... */
-	janus_rtcp_pli((char *)&buf, 12);
+static void janus_videoroom_reqpli(janus_videoroom_publisher *publisher, const char *reason) {
+	/* Send a PLI */
 	JANUS_LOG(LOG_VERB, "%s sending PLI to %"SCNu64" (%s)\n", reason, publisher->user_id, publisher->display ? publisher->display : "??");
-	gateway->relay_rtcp(publisher->session->handle, 1, buf, 12);
+	gateway->send_pli(publisher->session->handle);
 	/* Update the time of when we last sent a keyframe request */
 	publisher->fir_latest = janus_get_monotonic_time();
 }
@@ -1733,7 +1732,7 @@ static guint32 janus_videoroom_rtp_forwarder_add_helper(janus_videoroom_publishe
 	/* Do we need to bind to a port for RTCP? */
 	int fd = -1;
 	uint16_t local_rtcp_port = 0;
-	if(!is_data && rtcp_port > -1) {
+	if(!is_data && rtcp_port > 0) {
 		fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
 		if(fd < 0) {
 			janus_mutex_unlock(&p->rtp_forwarders_mutex);
@@ -3537,6 +3536,8 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 		if(audio_handle > 0) {
 			json_object_set_new(rtp_stream, "audio_stream_id", json_integer(audio_handle));
 			json_object_set_new(rtp_stream, "audio", json_integer(audio_port));
+			if(audio_rtcp_port > 0)
+				json_object_set_new(rtp_stream, "audio_rtcp", json_integer(audio_rtcp_port));
 			/* Also notify event handlers */
 			if(notify_events && gateway->events_is_enabled()) {
 				json_t *info = json_object();
@@ -3551,11 +3552,13 @@ static json_t *janus_videoroom_process_synchronous_request(janus_videoroom_sessi
 			}
 		}
 		if(video_handle[0] > 0 || video_handle[1] > 0 || video_handle[2] > 0) {
-			janus_videoroom_reqfir(publisher, "New RTP forward publisher");
+			janus_videoroom_reqpli(publisher, "New RTP forward publisher");
 			/* Done */
 			if(video_handle[0] > 0) {
 				json_object_set_new(rtp_stream, "video_stream_id", json_integer(video_handle[0]));
 				json_object_set_new(rtp_stream, "video", json_integer(video_port[0]));
+				if(video_rtcp_port > 0)
+					json_object_set_new(rtp_stream, "video_rtcp", json_integer(video_rtcp_port));
 				/* Also notify event handlers */
 				if(notify_events && gateway->events_is_enabled()) {
 					json_t *info = json_object();
@@ -4285,7 +4288,7 @@ void janus_videoroom_setup_media(janus_plugin_session *handle) {
 			if(s && s->feed) {
 				janus_videoroom_publisher *p = s->feed;
 				if(p && p->session) {
-					janus_videoroom_reqfir(p, "New subscriber available");
+					janus_videoroom_reqpli(p, "New subscriber available");
 					/* Also notify event handlers */
 					if(notify_events && gateway->events_is_enabled()) {
 						json_t *info = json_object();
@@ -4301,7 +4304,7 @@ void janus_videoroom_setup_media(janus_plugin_session *handle) {
 	janus_mutex_unlock(&sessions_mutex);
 }
 
-void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_videoroom_incoming_rtp(janus_plugin_session *handle, janus_plugin_rtp *pkt) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized) || !gateway)
 		return;
 	janus_videoroom_session *session = (janus_videoroom_session *)handle->plugin_handle;
@@ -4316,10 +4319,13 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 	}
 	janus_videoroom *videoroom = participant->room;
 
+	gboolean video = pkt->video;
+	char *buf = pkt->buffer;
+	uint16_t len = pkt->length;
 	/* In case this is an audio packet and we're doing talk detection, check the audio level extension */
 	if(!video && videoroom->audiolevel_event && participant->audio_active) {
-		int level = 0;
-		if(janus_rtp_header_extension_parse_audio_level(buf, len, participant->audio_level_extmap_id, &level) == 0) {
+		int level = pkt->extensions.audio_level;
+		if(level != -1) {
 			participant->audio_dBov_sum += level;
 			participant->audio_active_packets++;
 			participant->audio_dBov_level = level;
@@ -4503,6 +4509,8 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 		janus_videoroom_rtp_relay_packet packet;
 		packet.data = rtp;
 		packet.length = len;
+		packet.extensions = pkt->extensions;
+		packet.is_rtp = TRUE;
 		packet.is_video = video;
 		packet.svc = FALSE;
 		if(video && videoroom->do_svc) {
@@ -4548,9 +4556,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 					participant->remb_startup--;
 				}
 				JANUS_LOG(LOG_VERB, "Sending REMB (%s, %"SCNu32")\n", participant->display, bitrate);
-				char rtcpbuf[24];
-				janus_rtcp_remb((char *)(&rtcpbuf), 24, bitrate);
-				gateway->relay_rtcp(handle, video, rtcpbuf, 24);
+				gateway->send_remb(handle, bitrate);
 				if(participant->remb_startup == 0)
 					participant->remb_latest = janus_get_monotonic_time();
 			}
@@ -4575,7 +4581,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 				}
 				if((now-participant->fir_latest) >= ((gint64)videoroom->fir_freq*G_USEC_PER_SEC)) {
 					/* FIXME We send a FIR every tot seconds */
-					janus_videoroom_reqfir(participant, "Regular keyframe request");
+					janus_videoroom_reqpli(participant, "Regular keyframe request");
 				}
 			}
 		}
@@ -4583,7 +4589,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 	janus_videoroom_publisher_dereference_nodebug(participant);
 }
 
-void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len) {
+void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, janus_plugin_rtcp *packet) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	janus_videoroom_session *session = (janus_videoroom_session *)handle->plugin_handle;
@@ -4593,6 +4599,8 @@ void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char
 	}
 	if(g_atomic_int_get(&session->destroyed))
 		return;
+	char *buf = packet->buffer;
+	uint16_t len = packet->length;
 	if(session->participant_type == janus_videoroom_p_type_subscriber) {
 		/* A subscriber sent some RTCP, check what it is and if we need to forward it to the publisher */
 		janus_videoroom_subscriber *s = (janus_videoroom_subscriber *)session->participant;
@@ -4600,31 +4608,12 @@ void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char
 			return;
 		if(!s->video)
 			return;	/* The only feedback we handle is video related anyway... */
-		if(janus_rtcp_has_fir(buf, len)) {
-			/* We got a FIR, forward it to the publisher */
+		if(janus_rtcp_has_fir(buf, len) || janus_rtcp_has_pli(buf, len)) {
+			/* We got a FIR or PLI, forward a PLI it to the publisher */
 			if(s->feed) {
 				janus_videoroom_publisher *p = s->feed;
 				if(p && p->session) {
-					char rtcpbuf[20];
-					janus_rtcp_fir((char *)&rtcpbuf, 20, &p->fir_seq);
-					JANUS_LOG(LOG_VERB, "Got a FIR from a subscriber, forwarding it to %"SCNu64" (%s)\n", p->user_id, p->display ? p->display : "??");
-					gateway->relay_rtcp(p->session->handle, 1, rtcpbuf, 20);
-					/* Update the time of when we last sent a keyframe request */
-					p->fir_latest = janus_get_monotonic_time();
-				}
-			}
-		}
-		if(janus_rtcp_has_pli(buf, len)) {
-			/* We got a PLI, forward it to the publisher */
-			if(s->feed) {
-				janus_videoroom_publisher *p = s->feed;
-				if(p && p->session) {
-					char rtcpbuf[12];
-					janus_rtcp_pli((char *)&rtcpbuf, 12);
-					JANUS_LOG(LOG_VERB, "Got a PLI from a subscriber, forwarding it to %"SCNu64" (%s)\n", p->user_id, p->display ? p->display : "??");
-					gateway->relay_rtcp(p->session->handle, 1, rtcpbuf, 12);
-					/* Update the time of when we last sent a keyframe request */
-					p->fir_latest = janus_get_monotonic_time();
+					janus_videoroom_reqpli(p, "PLI from subscriber");
 				}
 			}
 		}
@@ -4635,10 +4624,10 @@ void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char
 	}
 }
 
-void janus_videoroom_incoming_data(janus_plugin_session *handle, char *label, char *buf, int len) {
+void janus_videoroom_incoming_data(janus_plugin_session *handle, janus_plugin_data *packet) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized) || !gateway)
 		return;
-	if(buf == NULL || len <= 0)
+	if(packet->buffer == NULL || packet->length == 0)
 		return;
 	janus_videoroom_session *session = (janus_videoroom_session *)handle->plugin_handle;
 	if(!session || g_atomic_int_get(&session->destroyed) || session->participant_type != janus_videoroom_p_type_publisher)
@@ -4650,6 +4639,8 @@ void janus_videoroom_incoming_data(janus_plugin_session *handle, char *label, ch
 		janus_videoroom_publisher_dereference_nodebug(participant);
 		return;
 	}
+	char *buf = packet->buffer;
+	uint16_t len = packet->length;
 	/* Any forwarder involved? */
 	janus_mutex_lock(&participant->rtp_forwarders_mutex);
 	/* Forward RTP to the appropriate port for the rtp_forwarders associated with this publisher, if there are any */
@@ -4669,18 +4660,19 @@ void janus_videoroom_incoming_data(janus_plugin_session *handle, char *label, ch
 		}
 	}
 	janus_mutex_unlock(&participant->rtp_forwarders_mutex);
-	/* Get a string out of the data */
-	char *text = g_malloc(len+1);
-	memcpy(text, buf, len);
-	*(text+len) = '\0';
-	JANUS_LOG(LOG_VERB, "Got a DataChannel message (%zu bytes) to forward: %s\n", strlen(text), text);
+	JANUS_LOG(LOG_VERB, "Got a %s DataChannel message (%d bytes) to forward\n",
+		packet->binary ? "binary" : "text", len);
 	/* Save the message if we're recording */
-	janus_recorder_save_frame(participant->drc, text, strlen(text));
+	janus_recorder_save_frame(participant->drc, buf, len);
 	/* Relay to all subscribers */
+	janus_videoroom_rtp_relay_packet pkt;
+	pkt.data = (struct rtp_header *)buf;
+	pkt.length = len;
+	pkt.is_rtp = FALSE;
+	pkt.textdata = !packet->binary;
 	janus_mutex_lock_nodebug(&participant->subscribers_mutex);
-	g_slist_foreach(participant->subscribers, janus_videoroom_relay_data_packet, text);
+	g_slist_foreach(participant->subscribers, janus_videoroom_relay_data_packet, &pkt);
 	janus_mutex_unlock_nodebug(&participant->subscribers_mutex);
-	g_free(text);
 	janus_videoroom_publisher_dereference_nodebug(participant);
 }
 
@@ -5258,6 +5250,21 @@ static void *janus_videoroom_handler(void *data) {
 					janus_mutex_unlock(&videoroom->mutex);
 					goto error;
 				}
+				janus_mutex_lock(&sessions_mutex);
+				session = janus_videoroom_lookup_session(msg->handle);
+				if(!session) {
+					janus_mutex_unlock(&sessions_mutex);
+					janus_mutex_unlock(&videoroom->mutex);
+					JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+					janus_videoroom_message_free(msg);
+					continue;
+				}
+				if(g_atomic_int_get(&session->destroyed)) {
+					janus_mutex_unlock(&sessions_mutex);
+					janus_mutex_unlock(&videoroom->mutex);
+					janus_videoroom_message_free(msg);
+					continue;
+				}
 				json_t *feed = json_object_get(root, "feed");
 				guint64 feed_id = json_integer_value(feed);
 				json_t *pvt = json_object_get(root, "private_id");
@@ -5277,6 +5284,7 @@ static void *janus_videoroom_handler(void *data) {
 					JANUS_LOG(LOG_ERR, "Invalid element (substream/spatial_layer should be 0, 1 or 2)\n");
 					error_code = JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid value (substream/spatial_layer should be 0, 1 or 2)");
+					janus_mutex_unlock(&sessions_mutex);
 					janus_mutex_unlock(&videoroom->mutex);
 					goto error;
 				}
@@ -5287,6 +5295,7 @@ static void *janus_videoroom_handler(void *data) {
 					JANUS_LOG(LOG_ERR, "Invalid element (temporal/temporal_layer should be 0, 1 or 2)\n");
 					error_code = JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT;
 					g_snprintf(error_cause, 512, "Invalid value (temporal/temporal_layer should be 0, 1 or 2)");
+					janus_mutex_unlock(&sessions_mutex);
 					janus_mutex_unlock(&videoroom->mutex);
 					goto error;
 				}
@@ -5296,6 +5305,7 @@ static void *janus_videoroom_handler(void *data) {
 					JANUS_LOG(LOG_ERR, "No such feed (%"SCNu64")\n", feed_id);
 					error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_FEED;
 					g_snprintf(error_cause, 512, "No such feed (%"SCNu64")", feed_id);
+					janus_mutex_unlock(&sessions_mutex);
 					janus_mutex_unlock(&videoroom->mutex);
 					goto error;
 				} else {
@@ -5310,6 +5320,7 @@ static void *janus_videoroom_handler(void *data) {
 							JANUS_LOG(LOG_ERR, "Unauthorized (this room requires a valid private_id)\n");
 							error_code = JANUS_VIDEOROOM_ERROR_UNAUTHORIZED;
 							g_snprintf(error_cause, 512, "Unauthorized (this room requires a valid private_id)");
+							janus_mutex_unlock(&sessions_mutex);
 							janus_mutex_unlock(&videoroom->mutex);
 							goto error;
 						}
@@ -5343,6 +5354,7 @@ static void *janus_videoroom_handler(void *data) {
 						JANUS_LOG(LOG_ERR, "Can't offer an SDP with no audio, video or data\n");
 						error_code = JANUS_VIDEOROOM_ERROR_INVALID_SDP;
 						g_snprintf(error_cause, 512, "Can't offer an SDP with no audio, video or data");
+						janus_mutex_unlock(&sessions_mutex);
 						goto error;
 					}
 					subscriber->audio = audio ? json_is_true(audio) : TRUE;	/* True by default */
@@ -5384,6 +5396,7 @@ static void *janus_videoroom_handler(void *data) {
 						janus_refcount_decrease(&owner->session->ref);
 						janus_refcount_decrease(&owner->ref);
 					}
+					janus_mutex_unlock(&sessions_mutex);
 					event = json_object();
 					json_object_set_new(event, "videoroom", json_string("attached"));
 					json_object_set_new(event, "room", json_integer(subscriber->room_id));
@@ -5582,13 +5595,11 @@ static void *janus_videoroom_handler(void *data) {
 					/* Send a new REMB */
 					if(session->started)
 						participant->remb_latest = janus_get_monotonic_time();
-					char rtcpbuf[24];
-					janus_rtcp_remb((char *)(&rtcpbuf), 24, participant->bitrate);
-					gateway->relay_rtcp(msg->handle, 1, rtcpbuf, 24);
+					gateway->send_remb(msg->handle, participant->bitrate);
 				}
 				if(keyframe && json_is_true(keyframe)) {
 					/* Send a FIR */
-					janus_videoroom_reqfir(participant, "Keyframe request");
+					janus_videoroom_reqpli(participant, "Keyframe request");
 				}
 				janus_mutex_lock(&participant->rec_mutex);
 				gboolean prev_recording_active = participant->recording_active;
@@ -5614,7 +5625,7 @@ static void *janus_videoroom_handler(void *data) {
 							strstr(participant->sdp, "m=application") != NULL);
 						if(strstr(participant->sdp, "m=video")) {
 							/* Send a FIR */
-							janus_videoroom_reqfir(participant, "Recording video");
+							janus_videoroom_reqpli(participant, "Recording video");
 						}
 					}
 				}
@@ -5795,7 +5806,7 @@ static void *janus_videoroom_handler(void *data) {
 						subscriber->video = newvideo;
 						if(subscriber->video) {
 							/* Send a FIR */
-							janus_videoroom_reqfir(publisher, "Restoring video for subscriber");
+							janus_videoroom_reqpli(publisher, "Restoring video for subscriber");
 						}
 					}
 					if(data && publisher->data && subscriber->data_offered)
@@ -5817,7 +5828,7 @@ static void *janus_videoroom_handler(void *data) {
 							json_decref(event);
 						} else {
 							/* Send a FIR */
-							janus_videoroom_reqfir(publisher, "Simulcasting substream change");
+							janus_videoroom_reqpli(publisher, "Simulcasting substream change");
 						}
 					}
 					if(subscriber->feed && subscriber->feed->vcodec == JANUS_VIDEOCODEC_VP8 &&
@@ -5835,7 +5846,7 @@ static void *janus_videoroom_handler(void *data) {
 							json_decref(event);
 						} else {
 							/* Send a FIR */
-							janus_videoroom_reqfir(publisher, "Simulcasting temporal layer change");
+							janus_videoroom_reqpli(publisher, "Simulcasting temporal layer change");
 						}
 					}
 				}
@@ -5856,7 +5867,7 @@ static void *janus_videoroom_handler(void *data) {
 							json_decref(event);
 						} else if(spatial_layer != subscriber->target_spatial_layer) {
 							/* Send a FIR to the new RTP forward publisher */
-							janus_videoroom_reqfir(publisher, "Need to downscale spatially");
+							janus_videoroom_reqpli(publisher, "Need to downscale spatially");
 						}
 						subscriber->target_spatial_layer = spatial_layer;
 					}
@@ -6068,7 +6079,7 @@ static void *janus_videoroom_handler(void *data) {
 				janus_mutex_unlock(&publisher->subscribers_mutex);
 				subscriber->feed = publisher;
 				/* Send a FIR to the new publisher */
-				janus_videoroom_reqfir(publisher, "Switching existing subscriber to new publisher");
+				janus_videoroom_reqpli(publisher, "Switching existing subscriber to new publisher");
 				/* Done */
 				subscriber->paused = paused;
 				event = json_object();
@@ -6330,43 +6341,45 @@ static void *janus_videoroom_handler(void *data) {
 				/* Generate an SDP string we can send back to the publisher */
 				char *answer_sdp = janus_sdp_write(answer);
 				/* Now turn the SDP into what we'll send subscribers, using the static payload types for making switching easier */
+				int mid_ext_id = 1;
+				while(mid_ext_id < 15) {
+					if(mid_ext_id != participant->audio_level_extmap_id &&
+							mid_ext_id != participant->video_orient_extmap_id &&
+							mid_ext_id != participant->playout_delay_extmap_id)
+						break;
+					mid_ext_id++;
+				}
+				int twcc_ext_id = 1;
+				while(twcc_ext_id < 15) {
+					if(twcc_ext_id != mid_ext_id &&
+							twcc_ext_id != participant->audio_level_extmap_id &&
+							twcc_ext_id != participant->video_orient_extmap_id &&
+							twcc_ext_id != participant->playout_delay_extmap_id)
+						break;
+					twcc_ext_id++;
+				}
 				offer = janus_sdp_generate_offer(s_name, answer->c_addr,
 					JANUS_SDP_OA_AUDIO, participant->audio,
 					JANUS_SDP_OA_AUDIO_CODEC, janus_audiocodec_name(participant->acodec),
 					JANUS_SDP_OA_AUDIO_PT, janus_audiocodec_pt(participant->acodec),
 					JANUS_SDP_OA_AUDIO_DIRECTION, JANUS_SDP_SENDONLY,
 					JANUS_SDP_OA_AUDIO_FMTP, participant->do_opusfec ? "useinbandfec=1" : NULL,
+					JANUS_SDP_OA_AUDIO_EXTENSION, JANUS_RTP_EXTMAP_AUDIO_LEVEL,
+						participant->audio_level_extmap_id > 0 ? participant->audio_level_extmap_id : 0,
+					JANUS_SDP_OA_AUDIO_EXTENSION, JANUS_RTP_EXTMAP_MID, mid_ext_id,
 					JANUS_SDP_OA_VIDEO, participant->video,
 					JANUS_SDP_OA_VIDEO_CODEC, janus_videocodec_name(participant->vcodec),
 					JANUS_SDP_OA_VIDEO_PT, janus_videocodec_pt(participant->vcodec),
 					JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
+					JANUS_SDP_OA_VIDEO_EXTENSION, JANUS_RTP_EXTMAP_MID, mid_ext_id,
+					JANUS_SDP_OA_VIDEO_EXTENSION, JANUS_RTP_EXTMAP_VIDEO_ORIENTATION,
+						participant->video_orient_extmap_id > 0 ? participant->video_orient_extmap_id : 0,
+					JANUS_SDP_OA_VIDEO_EXTENSION, JANUS_RTP_EXTMAP_PLAYOUT_DELAY,
+						participant->playout_delay_extmap_id > 0 ? participant->playout_delay_extmap_id : 0,
+					JANUS_SDP_OA_VIDEO_EXTENSION, JANUS_RTP_EXTMAP_TRANSPORT_WIDE_CC,
+						videoroom->transport_wide_cc_ext ? twcc_ext_id : 0,
 					JANUS_SDP_OA_DATA, participant->data,
 					JANUS_SDP_OA_DONE);
-				/* Add the extmap attributes, if needed */
-				if(participant->audio_level_extmap_id > 0) {
-					janus_sdp_mline *m = janus_sdp_mline_find(offer, JANUS_SDP_AUDIO);
-					if(m != NULL) {
-						janus_sdp_attribute *a = janus_sdp_attribute_create("extmap",
-							"%d %s\r\n", participant->audio_level_extmap_id, JANUS_RTP_EXTMAP_AUDIO_LEVEL);
-						janus_sdp_attribute_add_to_mline(m, a);
-					}
-				}
-				if(participant->video_orient_extmap_id > 0) {
-					janus_sdp_mline *m = janus_sdp_mline_find(offer, JANUS_SDP_VIDEO);
-					if(m != NULL) {
-						janus_sdp_attribute *a = janus_sdp_attribute_create("extmap",
-							"%d %s\r\n", participant->video_orient_extmap_id, JANUS_RTP_EXTMAP_VIDEO_ORIENTATION);
-						janus_sdp_attribute_add_to_mline(m, a);
-					}
-				}
-				if(participant->playout_delay_extmap_id > 0) {
-					janus_sdp_mline *m = janus_sdp_mline_find(offer, JANUS_SDP_VIDEO);
-					if(m != NULL) {
-						janus_sdp_attribute *a = janus_sdp_attribute_create("extmap",
-							"%d %s\r\n", participant->playout_delay_extmap_id, JANUS_RTP_EXTMAP_PLAYOUT_DELAY);
-						janus_sdp_attribute_add_to_mline(m, a);
-					}
-				}
 				/* Is this room recorded, or are we recording this publisher already? */
 				janus_mutex_lock(&participant->rec_mutex);
 				if(videoroom->record || participant->recording_active) {
@@ -6634,8 +6647,11 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 			if(override_mark_bit && !has_marker_bit) {
 				packet->data->markerbit = 1;
 			}
-			if(gateway != NULL)
-				gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
+			if(gateway != NULL) {
+				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
+					.extensions = packet->extensions };
+				gateway->relay_rtp(session->handle, &rtp);
+			}
 			if(override_mark_bit && !has_marker_bit) {
 				packet->data->markerbit = 0;
 			}
@@ -6655,10 +6671,7 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 					subscriber->feed->session->handle) {
 				/* Send a PLI */
 				JANUS_LOG(LOG_VERB, "We need a PLI for the simulcast context\n");
-				char rtcpbuf[12];
-				memset(rtcpbuf, 0, 12);
-				janus_rtcp_pli((char *)&rtcpbuf, 12);
-				gateway->relay_rtcp(subscriber->feed->session->handle, 1, rtcpbuf, 12);
+				gateway->send_pli(subscriber->feed->session->handle);
 			}
 			/* Do we need to drop this? */
 			if(!relay)
@@ -6692,8 +6705,11 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 					subscriber->sim_context.changed_substream);
 			}
 			/* Send the packet */
-			if(gateway != NULL)
-				gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
+			if(gateway != NULL) {
+				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
+					.extensions = packet->extensions };
+				gateway->relay_rtp(session->handle, &rtp);
+			}
 			/* Restore the timestamp and sequence number to what the publisher set them to */
 			packet->data->timestamp = htonl(packet->timestamp);
 			packet->data->seq_number = htons(packet->seq_number);
@@ -6705,8 +6721,11 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 			/* Fix sequence number and timestamp (publisher switching may be involved) */
 			janus_rtp_header_update(packet->data, &subscriber->context, TRUE, 4500);
 			/* Send the packet */
-			if(gateway != NULL)
-				gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
+			if(gateway != NULL) {
+				janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
+					.extensions = packet->extensions };
+				gateway->relay_rtp(session->handle, &rtp);
+			}
 			/* Restore the timestamp and sequence number to what the publisher set them to */
 			packet->data->timestamp = htonl(packet->timestamp);
 			packet->data->seq_number = htons(packet->seq_number);
@@ -6720,8 +6739,11 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 		/* Fix sequence number and timestamp (publisher switching may be involved) */
 		janus_rtp_header_update(packet->data, &subscriber->context, FALSE, 960);
 		/* Send the packet */
-		if(gateway != NULL)
-			gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
+		if(gateway != NULL) {
+			janus_plugin_rtp rtp = { .video = packet->is_video, .buffer = (char *)packet->data, .length = packet->length,
+				.extensions = packet->extensions };
+			gateway->relay_rtp(session->handle, &rtp);
+		}
 		/* Restore the timestamp and sequence number to what the publisher set them to */
 		packet->data->timestamp = htonl(packet->timestamp);
 		packet->data->seq_number = htons(packet->seq_number);
@@ -6731,7 +6753,11 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 }
 
 static void janus_videoroom_relay_data_packet(gpointer data, gpointer user_data) {
-	char *text = (char *)user_data;
+	janus_videoroom_rtp_relay_packet *packet = (janus_videoroom_rtp_relay_packet *)user_data;
+	if(!packet || packet->is_rtp || !packet->data || packet->length < 1) {
+		JANUS_LOG(LOG_ERR, "Invalid packet...\n");
+		return;
+	}
 	janus_videoroom_subscriber *subscriber = (janus_videoroom_subscriber *)data;
 	if(!subscriber || !subscriber->session || !subscriber->data || subscriber->paused) {
 		return;
@@ -6743,9 +6769,11 @@ static void janus_videoroom_relay_data_packet(gpointer data, gpointer user_data)
 	if(!session->started) {
 		return;
 	}
-	if(gateway != NULL && text != NULL) {
-		JANUS_LOG(LOG_VERB, "Forwarding DataChannel message (%zu bytes) to viewer: %s\n", strlen(text), text);
-		gateway->relay_data(session->handle, NULL, text, strlen(text));
+	if(gateway != NULL && packet->data != NULL) {
+		JANUS_LOG(LOG_VERB, "Forwarding %s DataChannel message (%d bytes) to viewer\n",
+			packet->textdata ? "text" : "binary", packet->length);
+		janus_plugin_data data = { .label = NULL, .binary = !packet->textdata, .buffer = (char *)packet->data, .length = packet->length };
+		gateway->relay_data(session->handle, &data);
 	}
 	return;
 }
@@ -6761,7 +6789,7 @@ static void janus_videoroom_rtp_forwarder_rtcp_receive(janus_videoroom_rtp_forwa
 		/* We only handle incoming video PLIs or FIR at the moment */
 		if(!janus_rtcp_has_fir(buffer, len) && !janus_rtcp_has_pli(buffer, len))
 			return;
-		janus_videoroom_reqfir((janus_videoroom_publisher *)forward->source, "RTCP from forwarder");
+		janus_videoroom_reqpli((janus_videoroom_publisher *)forward->source, "RTCP from forwarder");
 	}
 }
 

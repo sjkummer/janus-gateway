@@ -59,12 +59,20 @@ janus_sdp *janus_sdp_preparse(void *ice_handle, const char *jsep_sdp, char *erro
 					/* Found mid attribute */
 					if(m->type == JANUS_SDP_AUDIO && m->port > 0) {
 						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Audio mid: %s\n", handle->handle_id, a->value);
+						if(strlen(a->value) > 16) {
+							JANUS_LOG(LOG_ERR, "[%"SCNu64"] Audio mid too large: (%zu > 16)\n", handle->handle_id, strlen(a->value));
+							return NULL;
+						}
 						if(handle->audio_mid == NULL)
 							handle->audio_mid = g_strdup(a->value);
 						if(handle->stream_mid == NULL)
 							handle->stream_mid = handle->audio_mid;
 					} else if(m->type == JANUS_SDP_VIDEO && m->port > 0) {
 						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Video mid: %s\n", handle->handle_id, a->value);
+						if(strlen(a->value) > 16) {
+							JANUS_LOG(LOG_ERR, "[%"SCNu64"] Video mid too large: (%zu > 16)\n", handle->handle_id, strlen(a->value));
+							return NULL;
+						}
 						if(handle->video_mid == NULL)
 							handle->video_mid = g_strdup(a->value);
 						if(handle->stream_mid == NULL)
@@ -278,17 +286,25 @@ int janus_sdp_process(void *ice_handle, janus_sdp *remote_sdp, gboolean update) 
 		GList *tempA = m->attributes;
 		while(tempA) {
 			janus_sdp_attribute *a = (janus_sdp_attribute *)tempA->data;
-			if(a->name) {
+			if(a->name && a->value) {
 				if(!strcasecmp(a->name, "mid")) {
 					/* Found mid attribute */
 					if(m->type == JANUS_SDP_AUDIO && m->port > 0) {
 						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Audio mid: %s\n", handle->handle_id, a->value);
+						if(strlen(a->value) > 16) {
+							JANUS_LOG(LOG_ERR, "[%"SCNu64"] Audio mid too large: (%zu > 16)\n", handle->handle_id, strlen(a->value));
+							return -2;
+						}
 						if(handle->audio_mid == NULL)
 							handle->audio_mid = g_strdup(a->value);
 						if(handle->stream_mid == NULL)
 							handle->stream_mid = handle->audio_mid;
 					} else if(m->type == JANUS_SDP_VIDEO && m->port > 0) {
 						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Video mid: %s\n", handle->handle_id, a->value);
+						if(strlen(a->value) > 16) {
+							JANUS_LOG(LOG_ERR, "[%"SCNu64"] Video mid too large: (%zu > 16)\n", handle->handle_id, strlen(a->value));
+							return -2;
+						}
 						if(handle->video_mid == NULL)
 							handle->video_mid = g_strdup(a->value);
 						if(handle->stream_mid == NULL)
@@ -505,12 +521,26 @@ int janus_sdp_process(void *ice_handle, janus_sdp *remote_sdp, gboolean update) 
 						if(sscanf(a->value, "%d apt=%d", &rtx_ptype, &ptype) != 2) {
 							JANUS_LOG(LOG_ERR, "[%"SCNu64"] Failed to parse fmtp/apt attribute...\n", handle->handle_id);
 						} else {
-							if(janus_is_rfc4588_enabled()) {
-								rtx = TRUE;
-								janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX);
-								if(stream->rtx_payload_types == NULL)
-									stream->rtx_payload_types = g_hash_table_new(NULL, NULL);
-								g_hash_table_insert(stream->rtx_payload_types, GINT_TO_POINTER(ptype), GINT_TO_POINTER(rtx_ptype));
+							rtx = TRUE;
+							janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_RFC4588_RTX);
+							if(stream->rtx_payload_types == NULL)
+								stream->rtx_payload_types = g_hash_table_new(NULL, NULL);
+							g_hash_table_insert(stream->rtx_payload_types, GINT_TO_POINTER(ptype), GINT_TO_POINTER(rtx_ptype));
+						}
+					}
+				} else if(!strcasecmp(a->name, "rtpmap")) {
+					if(a->value) {
+						int ptype = atoi(a->value);
+						if(ptype > -1) {
+							char *cr = strchr(a->value, '/');
+							if(cr != NULL) {
+								cr++;
+								uint32_t clock_rate = 0;
+								if(janus_string_to_uint32(cr, &clock_rate) == 0) {
+									if(stream->clock_rates == NULL)
+										stream->clock_rates = g_hash_table_new(NULL, NULL);
+									g_hash_table_insert(stream->clock_rates, GINT_TO_POINTER(ptype), GUINT_TO_POINTER(clock_rate));
+								}
 							}
 						}
 					}
