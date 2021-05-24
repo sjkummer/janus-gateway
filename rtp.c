@@ -91,7 +91,7 @@ const char *janus_rtp_header_extension_get_from_id(const char *sdp, int id) {
 			if(strstr(line, extmap)) {
 				/* Gotcha! */
 				char extension[100];
-				if(sscanf(line, "a=extmap:%d %s", &id, extension) == 2) {
+				if(sscanf(line, "a=extmap:%d %99s", &id, extension) == 2) {
 					*next = '\n';
 					if(strstr(extension, JANUS_RTP_EXTMAP_AUDIO_LEVEL))
 						return JANUS_RTP_EXTMAP_AUDIO_LEVEL;
@@ -267,26 +267,6 @@ int janus_rtp_header_extension_parse_rid(char *buf, int len, int id,
 	}
 	memcpy(sdes_item, ext+1, val_len);
 	*(sdes_item+val_len) = '\0';
-	return 0;
-}
-
-int janus_rtp_header_extension_parse_framemarking(char *buf, int len, int id, janus_videocodec codec, uint8_t *tid) {
-	char *ext = NULL;
-	if(janus_rtp_header_extension_find(buf, len, id, NULL, NULL, &ext) < 0)
-		return -1;
-	/*  0                   1                   2                   3
-	    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-	   |  ID=? |  L=2  |S|E|I|D|B| TID |   LID         |    TL0PICIDX  |
-	   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-	*/
-	if(ext == NULL)
-		return -2;
-	int val_len = (*ext & 0x0F) + 1;
-	if (val_len < 2 || val_len > len-(ext-buf)-1)
-		return -3;
-	if(tid)
-		*tid = (*(ext+1) & 0x07);
 	return 0;
 }
 
@@ -781,6 +761,7 @@ const char *janus_srtp_error_str(int error) {
 
 /* Payload types we'll offer internally */
 #define OPUS_PT		111
+#define MULTIOPUS_PT	OPUS_PT
 #define ISAC32_PT	104
 #define ISAC16_PT	103
 #define PCMU_PT		0
@@ -789,12 +770,16 @@ const char *janus_srtp_error_str(int error) {
 #define VP8_PT		96
 #define VP9_PT		101
 #define H264_PT		107
+#define AV1_PT		98
+#define H265_PT		100
 const char *janus_audiocodec_name(janus_audiocodec acodec) {
 	switch(acodec) {
 		case JANUS_AUDIOCODEC_NONE:
 			return "none";
 		case JANUS_AUDIOCODEC_OPUS:
 			return "opus";
+		case JANUS_AUDIOCODEC_MULTIOPUS:
+			return "multiopus";
 		case JANUS_AUDIOCODEC_PCMU:
 			return "pcmu";
 		case JANUS_AUDIOCODEC_PCMA:
@@ -815,6 +800,8 @@ janus_audiocodec janus_audiocodec_from_name(const char *name) {
 		return JANUS_AUDIOCODEC_NONE;
 	else if(!strcasecmp(name, "opus"))
 		return JANUS_AUDIOCODEC_OPUS;
+	else if(!strcasecmp(name, "multiopus"))
+		return JANUS_AUDIOCODEC_MULTIOPUS;
 	else if(!strcasecmp(name, "isac32"))
 		return JANUS_AUDIOCODEC_ISAC_32K;
 	else if(!strcasecmp(name, "isac16"))
@@ -834,6 +821,8 @@ int janus_audiocodec_pt(janus_audiocodec acodec) {
 			return -1;
 		case JANUS_AUDIOCODEC_OPUS:
 			return OPUS_PT;
+		case JANUS_AUDIOCODEC_MULTIOPUS:
+			return MULTIOPUS_PT;
 		case JANUS_AUDIOCODEC_ISAC_32K:
 			return ISAC32_PT;
 		case JANUS_AUDIOCODEC_ISAC_16K:
@@ -860,6 +849,10 @@ const char *janus_videocodec_name(janus_videocodec vcodec) {
 			return "vp9";
 		case JANUS_VIDEOCODEC_H264:
 			return "h264";
+		case JANUS_VIDEOCODEC_AV1:
+			return "av1";
+		case JANUS_VIDEOCODEC_H265:
+			return "h265";
 		default:
 			/* Shouldn't happen */
 			return "vp8";
@@ -874,6 +867,10 @@ janus_videocodec janus_videocodec_from_name(const char *name) {
 		return JANUS_VIDEOCODEC_VP9;
 	else if(!strcasecmp(name, "h264"))
 		return JANUS_VIDEOCODEC_H264;
+	else if(!strcasecmp(name, "av1"))
+		return JANUS_VIDEOCODEC_AV1;
+	else if(!strcasecmp(name, "h265"))
+		return JANUS_VIDEOCODEC_H265;
 	JANUS_LOG(LOG_WARN, "Unsupported video codec '%s'\n", name);
 	return JANUS_VIDEOCODEC_NONE;
 }
@@ -887,6 +884,10 @@ int janus_videocodec_pt(janus_videocodec vcodec) {
 			return VP9_PT;
 		case JANUS_VIDEOCODEC_H264:
 			return H264_PT;
+		case JANUS_VIDEOCODEC_AV1:
+			return AV1_PT;
+		case JANUS_VIDEOCODEC_H265:
+			return H265_PT;
 		default:
 			/* Shouldn't happen */
 			return VP8_PT;
@@ -900,10 +901,11 @@ void janus_rtp_simulcasting_context_reset(janus_rtp_simulcasting_context *contex
 	memset(context, 0, sizeof(*context));
 	context->rid_ext_id = -1;
 	context->substream = -1;
+	context->substream_target_temp = -1;
 	context->templayer = -1;
 }
 
-void janus_rtp_simulcasting_prepare(json_t *simulcast, int *rid_ext_id, int *framemarking_ext_id, uint32_t *ssrcs, char **rids) {
+void janus_rtp_simulcasting_prepare(json_t *simulcast, int *rid_ext_id, uint32_t *ssrcs, char **rids) {
 	if(simulcast == NULL)
 		return;
 	json_t *r = json_object_get(simulcast, "rids");
@@ -911,12 +913,11 @@ void janus_rtp_simulcasting_prepare(json_t *simulcast, int *rid_ext_id, int *fra
 	if(r && json_array_size(r) > 0) {
 		JANUS_LOG(LOG_VERB, "  -- Simulcasting is rid based\n");
 		size_t i = 0;
-		for(i=0; i<json_array_size(r); i++) {
-			if(i == 3)
-				break;
-			json_t *rid = json_array_get(r, i);
+		int count = json_array_size(r);
+		for(i=count; i > 0; i--) {
+			json_t *rid = json_array_get(r, i-1);
 			if(rid && json_is_string(rid) && rids)
-				rids[i] = g_strdup(json_string_value(rid));
+				rids[count-i] = g_strdup(json_string_value(rid));
 		}
 		json_t *rid_ext = json_object_get(simulcast, "rid-ext");
 		if(rid_ext_id != NULL)
@@ -932,9 +933,6 @@ void janus_rtp_simulcasting_prepare(json_t *simulcast, int *rid_ext_id, int *fra
 				ssrcs[i] = json_integer_value(ssrc);
 		}
 	}
-	json_t *fm_ext = json_object_get(simulcast, "framemarking-ext");
-	if(framemarking_ext_id != NULL)
-		*framemarking_ext_id = json_integer_value(fm_ext);
 }
 
 gboolean janus_rtp_simulcasting_context_process_rtp(janus_rtp_simulcasting_context *context,
@@ -944,22 +942,32 @@ gboolean janus_rtp_simulcasting_context_process_rtp(janus_rtp_simulcasting_conte
 		return FALSE;
 	janus_rtp_header *header = (janus_rtp_header *)buf;
 	uint32_t ssrc = ntohl(header->ssrc);
-	if(ssrc != ssrcs[0] && ssrc != ssrcs[1] && ssrc != ssrcs[2]) {
+	int substream = -1;
+	if(ssrc == *(ssrcs)) {
+		substream = 0;
+	} else if(ssrc == *(ssrcs+1)) {
+		substream = 1;
+	} else if(ssrc == *(ssrcs+2)) {
+		substream = 2;
+	} else {
 		/* We don't recognize this SSRC, check if rid can help us */
 		if(context->rid_ext_id < 1 || rids == NULL)
 			return FALSE;
 		char sdes_item[16];
 		if(janus_rtp_header_extension_parse_rid(buf, len, context->rid_ext_id, sdes_item, sizeof(sdes_item)) != 0)
 			return FALSE;
-		if(rids[2] != NULL && !strcmp(rids[2], sdes_item)) {
+		if(rids[0] != NULL && !strcmp(rids[0], sdes_item)) {
 			JANUS_LOG(LOG_VERB, "Simulcasting: rid=%s --> ssrc=%"SCNu32"\n", sdes_item, ssrc);
 			*(ssrcs) = ssrc;
+			substream = 0;
 		} else if(rids[1] != NULL && !strcmp(rids[1], sdes_item)) {
 			JANUS_LOG(LOG_VERB, "Simulcasting: rid=%s --> ssrc=%"SCNu32"\n", sdes_item, ssrc);
 			*(ssrcs+1) = ssrc;
-		} else if(rids[0] != NULL && !strcmp(rids[0], sdes_item)) {
+			substream = 1;
+		} else if(rids[2] != NULL && !strcmp(rids[2], sdes_item)) {
 			JANUS_LOG(LOG_VERB, "Simulcasting: rid=%s --> ssrc=%"SCNu32"\n", sdes_item, ssrc);
 			*(ssrcs+2) = ssrc;
+			substream = 2;
 		} else {
 			JANUS_LOG(LOG_WARN, "Simulcasting: unknown rid '%s'...\n", sdes_item);
 			return FALSE;
@@ -969,60 +977,84 @@ gboolean janus_rtp_simulcasting_context_process_rtp(janus_rtp_simulcasting_conte
 	context->changed_substream = FALSE;
 	context->changed_temporal = FALSE;
 	context->need_pli = FALSE;
+	gint64 now = janus_get_monotonic_time();
 	/* Access the packet payload */
 	int plen = 0;
 	char *payload = janus_rtp_payload(buf, len, &plen);
 	if(payload == NULL)
 		return FALSE;
-	if(context->substream != context->substream_target) {
-		/* There has been a change: let's wait for a keyframe on the target */
-		int step = (context->substream < 1 && context->substream_target == 2);
-		if((ssrc == *(ssrcs + context->substream_target)) || (step && ssrc == *(ssrcs + step))) {
-			if((vcodec == JANUS_VIDEOCODEC_VP8 && janus_vp8_is_keyframe(payload, plen)) ||
-					(vcodec == JANUS_VIDEOCODEC_H264 && janus_h264_is_keyframe(payload, plen))) {
-				uint32_t ssrc_old = 0;
-				if(context->substream != -1)
-					ssrc_old = *(ssrcs + context->substream);
-				JANUS_LOG(LOG_VERB, "Received keyframe on SSRC %"SCNu32", switching (was %"SCNu32")\n", ssrc, ssrc_old);
-				context->substream = (ssrc == *(ssrcs + context->substream_target) ? context->substream_target : step);
-				/* Notify the caller that the substream changed */
-				context->changed_substream = TRUE;
-			//~ } else {
-				//~ JANUS_LOG(LOG_WARN, "Not a keyframe on SSRC %"SCNu32" yet, waiting before switching\n", ssrc);
-			}
+	/* Check what's our target */
+	if(context->substream_target_temp != -1 && (substream > context->substream_target_temp ||
+			context->substream_target <= context->substream_target_temp)) {
+		/* We either just received media on a substream that is higher than
+		 * the target we dropped to (which means the one we want is now flowing
+		 * again) or we've been requested a lower substream target instead */
+		context->substream_target_temp = -1;
+	}
+	int target = (context->substream_target_temp == -1) ? context->substream_target : context->substream_target_temp;
+	/* Check what we need to do with the packet */
+	if(context->substream == -1) {
+		if((vcodec == JANUS_VIDEOCODEC_VP8 && janus_vp8_is_keyframe(payload, plen)) ||
+				(vcodec == JANUS_VIDEOCODEC_H264 && janus_h264_is_keyframe(payload, plen))) {
+			context->substream = substream;
+			/* Notify the caller that the substream changed */
+			context->changed_substream = TRUE;
+			context->last_relayed = now;
+		} else {
+			/* Don't relay anything until we get a keyframe */
+			return FALSE;
+		}
+	} else if(context->substream != target) {
+		/* We're not on the substream we'd like: let's wait for a keyframe on the target */
+		if(((context->substream < target && substream > context->substream) ||
+				(context->substream > target && substream < context->substream)) &&
+					((vcodec == JANUS_VIDEOCODEC_VP8 && janus_vp8_is_keyframe(payload, plen)) ||
+					(vcodec == JANUS_VIDEOCODEC_H264 && janus_h264_is_keyframe(payload, plen)))) {
+			JANUS_LOG(LOG_VERB, "Received keyframe on #%d (SSRC %"SCNu32"), switching (was #%d/%"SCNu32")\n",
+				substream, ssrc, context->substream, *(ssrcs + context->substream));
+			context->substream = substream;
+			/* Notify the caller that the substream changed */
+			context->changed_substream = TRUE;
+			context->last_relayed = now;
 		}
 	}
 	/* If we haven't received our desired substream yet, let's drop temporarily */
 	if(context->last_relayed == 0) {
 		/* Let's start slow */
-		context->last_relayed = janus_get_monotonic_time();
-	} else {
+		context->last_relayed = now;
+	} else if(context->substream > 0) {
 		/* Check if too much time went by with no packet relayed */
-		gint64 now = janus_get_monotonic_time();
-		if(now-context->last_relayed >= (context->drop_trigger ? context->drop_trigger : 250000)) {
+		if((now - context->last_relayed) > (context->drop_trigger ? context->drop_trigger : 250000)) {
 			context->last_relayed = now;
-			int substream = context->substream-1;
-			if(substream < 0)
-				substream = 0;
-			if(context->substream != substream) {
-				if(context->substream_target != substream) {
-					JANUS_LOG(LOG_WARN, "No packet received on substream %d for a while, falling back to %d\n",
-						context->substream, substream);
-					context->substream_target = substream;
+			if(context->substream != substream && context->substream_target_temp != 0) {
+				if(context->substream_target > substream) {
+					int prev_target = context->substream_target_temp;
+					if(context->substream_target_temp == -1)
+						context->substream_target_temp = context->substream_target - 1;
+					else
+						context->substream_target_temp--;
+					if(context->substream_target_temp < 0)
+						context->substream_target_temp = 0;
+					if(context->substream_target_temp != prev_target) {
+						JANUS_LOG(LOG_WARN, "No packet received on substream %d for a while, falling back to %d\n",
+							context->substream, context->substream_target_temp);
+						/* Notify the caller that we (still) need a PLI */
+						context->need_pli = TRUE;
+					}
 				}
-				/* Notify the caller that we (still) need a PLI */
-				context->need_pli = TRUE;
 			}
 		}
 	}
 	/* Do we need to drop this? */
-	if(ssrc != *(ssrcs + context->substream)) {
+	if(context->substream < 0)
+		return FALSE;
+	if(substream != context->substream) {
 		JANUS_LOG(LOG_HUGE, "Dropping packet (it's from SSRC %"SCNu32", but we're only relaying SSRC %"SCNu32" now\n",
 			ssrc, *(ssrcs + context->substream));
 		return FALSE;
 	}
 	context->last_relayed = janus_get_monotonic_time();
-	/* Temporal layers are only available for VP8 and (partially) H.264, so don't do anything else for other codecs */
+	/* Temporal layers are only available for VP8, so don't do anything else for other codecs */
 	if(vcodec == JANUS_VIDEOCODEC_VP8) {
 		/* Check if there's any temporal scalability to take into account */
 		uint16_t picid = 0;
@@ -1032,27 +1064,6 @@ gboolean janus_rtp_simulcasting_context_process_rtp(janus_rtp_simulcasting_conte
 		uint8_t keyidx = 0;
 		if(janus_vp8_parse_descriptor(payload, plen, &picid, &tlzi, &tid, &ybit, &keyidx) == 0) {
 			//~ JANUS_LOG(LOG_WARN, "%"SCNu16", %u, %u, %u, %u\n", picid, tlzi, tid, ybit, keyidx);
-			if(context->templayer != context->templayer_target && tid == context->templayer_target) {
-				/* FIXME We should be smarter in deciding when to switch */
-				context->templayer = context->templayer_target;
-				/* Notify the caller that the temporal layer changed */
-				context->changed_temporal = TRUE;
-			}
-			if(context->templayer != -1 && tid > context->templayer) {
-				JANUS_LOG(LOG_HUGE, "Dropping packet (it's temporal layer %d, but we're capping at %d)\n",
-					tid, context->templayer);
-				/* We increase the base sequence number, or there will be gaps when delivering later */
-				if(sc)
-					sc->v_base_seq++;
-				return FALSE;
-			}
-		}
-	} else if(vcodec == JANUS_VIDEOCODEC_H264) {
-		/* Use the frame-marking extension to account for temporal scalability */
-		uint8_t tid = 0;
-		if(janus_rtp_header_extension_parse_framemarking(buf, len,
-				context->framemarking_ext_id, JANUS_VIDEOCODEC_H264, &tid) == 0) {
-			JANUS_LOG(LOG_HUGE, "Frame marking extension found: tid=%d\n", tid);
 			if(context->templayer != context->templayer_target && tid == context->templayer_target) {
 				/* FIXME We should be smarter in deciding when to switch */
 				context->templayer = context->templayer_target;
